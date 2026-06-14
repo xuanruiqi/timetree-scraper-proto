@@ -2,10 +2,27 @@ import asyncio
 import argparse
 import json
 from datetime import date, datetime, timedelta
-from playwright.async_api import async_playwright
+from typing import Any, Literal, TypeAlias, cast
+
+from playwright.async_api import Response, async_playwright
 
 
-def parse_args():
+JsonValue: TypeAlias = (
+    bool
+    | int
+    | float
+    | str
+    | list["JsonValue"]
+    | dict[str, "JsonValue"]
+    | None
+)
+EventPayload: TypeAlias = dict[str, JsonValue]
+OutputFormat: TypeAlias = Literal["json", "ics"]
+DateValue: TypeAlias = date | datetime
+ParsedDateValue: TypeAlias = DateValue | None
+
+
+def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Scrape public TimeTree events into JSON or ICS."
     )
@@ -19,7 +36,9 @@ def parse_args():
     return parser.parse_args()
 
 
-def output_format(output_file, requested_format):
+def output_format(
+    output_file: str, requested_format: OutputFormat | None
+) -> OutputFormat:
     if requested_format:
         return requested_format
     if output_file.lower().endswith(".ics"):
@@ -27,7 +46,7 @@ def output_format(output_file, requested_format):
     return "json"
 
 
-def first_value(mapping, *keys):
+def first_value(mapping: EventPayload, *keys: str) -> JsonValue:
     for key in keys:
         value = mapping
         for part in key.split("."):
@@ -40,7 +59,7 @@ def first_value(mapping, *keys):
     return None
 
 
-def parse_datetime_value(value):
+def parse_datetime_value(value: JsonValue) -> ParsedDateValue:
     if not value:
         return None
     if isinstance(value, (datetime, date)):
@@ -52,11 +71,11 @@ def parse_datetime_value(value):
                 return datetime.fromisoformat(normalized)
             return date.fromisoformat(normalized)
         except ValueError:
-            return value
+            return None
     return value
 
 
-def parse_bool_value(value):
+def parse_bool_value(value: JsonValue) -> bool:
     if isinstance(value, bool):
         return value
     if isinstance(value, str):
@@ -64,18 +83,18 @@ def parse_bool_value(value):
     return bool(value)
 
 
-def date_part(value):
+def date_part(value: DateValue) -> date:
     if isinstance(value, datetime):
         return value.date()
     return value
 
 
-def write_json(output_file, events):
+def write_json(output_file: str, events: list[EventPayload]) -> None:
     with open(output_file, "w") as f:
         json.dump({"public_events": events}, f, indent=2)
 
 
-def write_ics(output_file, events):
+def write_ics(output_file: str, events: list[EventPayload]) -> None:
     from ics import Calendar, Event
 
     calendar = Calendar()
@@ -173,18 +192,21 @@ def write_ics(output_file, events):
         f.writelines(calendar.serialize_iter())
 
 
-def write_events(output_file, events, file_format):
+def write_events(
+    output_file: str, events: list[EventPayload], file_format: OutputFormat
+) -> None:
     if file_format == "ics":
         write_ics(output_file, events)
     else:
         write_json(output_file, events)
 
 
-async def main():
+async def main() -> None:
     args = parse_args()
-    file_format = output_format(args.output_file, args.format)
+    requested_format = cast(OutputFormat | None, args.format)
+    file_format = output_format(args.output_file, requested_format)
     
-    all_events = []
+    all_events: list[EventPayload] = []
     current_request_done = asyncio.Event()
     last_response_empty = False
 
@@ -192,17 +214,23 @@ async def main():
         browser = await p.chromium.launch()
         page = await browser.new_page()
 
-        async def handle_response(response):
+        async def handle_response(response: Response) -> None:
             nonlocal last_response_empty
             if "public_events" in response.url and response.request.method == "GET":
                 try:
-                    data = await response.json()
+                    data: Any = await response.json()
                     events = data.get("public_events", [])
+                    if not isinstance(events, list):
+                        events = []
                     print(f"Captured {len(events)} events from {response.url}")
                     if not events:
                         last_response_empty = True
                     else:
-                        all_events.extend(events)
+                        all_events.extend(
+                            cast(EventPayload, event)
+                            for event in events
+                            if isinstance(event, dict)
+                        )
                     current_request_done.set()
                 except Exception as e:
                     print(e)
@@ -247,7 +275,7 @@ async def main():
         await browser.close()
 
 
-def cli():
+def cli() -> None:
     asyncio.run(main())
 
 
