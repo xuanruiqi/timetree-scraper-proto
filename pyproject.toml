@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "timetree-scraper"
+version = "0.1.0"
+description = "Scrape public TimeTree events into JSON or ICS."
+readme = ""
+requires-python = ">=3.10"
+dependencies = [
+    "ics>=0.7",
+    "playwright>=1.45",
+]
+
+[project.scripts]
+extract-timetree = "extract_timetree:cli"
+
+[tool.setuptools]
+py-modules = ["extract_timetree"]
