@@ -150,7 +150,7 @@ def as_datetime(value: DateValue) -> datetime:
 
 def write_json(output_file: str, events: list[EventPayload]) -> None:
     """Write the raw events to ``output_file`` as ``{"public_events": [...]}``."""
-    with open(output_file, "w") as f:
+    with open(output_file, "w", encoding="utf-8") as f:
         json.dump({"public_events": events}, f, indent=2)
 
 
@@ -224,7 +224,7 @@ def write_ics(output_file: str, events: list[EventPayload]) -> None:
         else:
             calendar.events.add(event)
 
-    with open(output_file, "w") as f:
+    with open(output_file, "w", encoding="utf-8") as f:
         f.writelines(calendar.serialize_iter())
 
 
