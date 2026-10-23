@@ -1,7 +1,7 @@
 import asyncio
 import argparse
 import json
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, time, timedelta, timezone
 from typing import Any, Literal, TypeAlias, cast
 
 from playwright.async_api import Response, async_playwright
@@ -21,8 +21,12 @@ OutputFormat: TypeAlias = Literal["json", "ics"]
 DateValue: TypeAlias = date | datetime
 ParsedDateValue: TypeAlias = DateValue | None
 
+# Numeric timestamps larger than this are in milliseconds, not seconds.
+MAX_TIMESTAMP_SECONDS = datetime.max.replace(tzinfo=timezone.utc).timestamp()
+
 
 def parse_args() -> argparse.Namespace:
+    """Parse command-line arguments: the calendar URL, output path and optional format."""
     parser = argparse.ArgumentParser(
         description="Scrape public TimeTree events into JSON or ICS."
     )
@@ -39,6 +43,11 @@ def parse_args() -> argparse.Namespace:
 def output_format(
     output_file: str, requested_format: OutputFormat | None
 ) -> OutputFormat:
+    """Decide which format to write.
+
+    An explicitly requested format wins. Otherwise a ``.ics`` extension
+    (case-insensitive) selects ICS, and anything else falls back to JSON.
+    """
     if requested_format:
         return requested_format
     if output_file.lower().endswith(".ics"):
@@ -47,6 +56,15 @@ def output_format(
 
 
 def first_value(mapping: EventPayload, *keys: str) -> JsonValue:
+    """Return the value of the first key in ``keys`` that is present and non-empty.
+
+    Keys may be dotted paths (e.g. ``"place.name"``) to look inside nested
+    dicts. A key counts as missing if any part of its path is absent or its
+    value is ``None`` or ``""``. Returns ``None`` if no key matches.
+
+    This lets callers list several possible field names, since the
+    TimeTree payload's field names are not guaranteed.
+    """
     for key in keys:
         value = mapping
         for part in key.split("."):
@@ -60,6 +78,14 @@ def first_value(mapping: EventPayload, *keys: str) -> JsonValue:
 
 
 def parse_datetime_value(value: JsonValue) -> ParsedDateValue:
+    """Convert an event's start or end value to a ``datetime`` or ``date``.
+
+    ISO 8601 strings containing ``T`` become a ``datetime``, and other strings
+    are parsed as a ``date``. A trailing ``Z`` is treated as UTC. Numbers are
+    Unix timestamps in seconds or milliseconds and become a UTC ``datetime``.
+    Returns ``None`` for empty values, values that fail to parse, and any
+    other type.
+    """
     if not value:
         return None
     if isinstance(value, (datetime, date)):
@@ -72,10 +98,22 @@ def parse_datetime_value(value: JsonValue) -> ParsedDateValue:
             return date.fromisoformat(normalized)
         except ValueError:
             return None
-    return value
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        timestamp = value / 1000 if value > MAX_TIMESTAMP_SECONDS else value
+        try:
+            return datetime.fromtimestamp(timestamp, tz=timezone.utc)
+        except (OverflowError, OSError, ValueError):
+            return None
+    return None
 
 
 def parse_bool_value(value: JsonValue) -> bool:
+    """Interpret a JSON value as a boolean flag.
+
+    Strings are true only if they are ``"1"``, ``"true"``, ``"yes"`` or
+    ``"y"`` (case-insensitive, surrounding whitespace ignored). Other values
+    use Python truthiness.
+    """
     if isinstance(value, bool):
         return value
     if isinstance(value, str):
@@ -84,17 +122,41 @@ def parse_bool_value(value: JsonValue) -> bool:
 
 
 def date_part(value: DateValue) -> date:
+    """Return the calendar date of a ``datetime``, or a ``date`` unchanged."""
     if isinstance(value, datetime):
         return value.date()
     return value
 
 
+def as_datetime(value: DateValue) -> datetime:
+    """Return a ``datetime`` unchanged, or a ``date`` as midnight on that day."""
+    if isinstance(value, datetime):
+        return value
+    return datetime.combine(value, time())
+
+
 def write_json(output_file: str, events: list[EventPayload]) -> None:
+    """Write the raw events to ``output_file`` as ``{"public_events": [...]}``."""
     with open(output_file, "w") as f:
         json.dump({"public_events": events}, f, indent=2)
 
 
 def write_ics(output_file: str, events: list[EventPayload]) -> None:
+    """Convert the events to iCalendar entries and write them to ``output_file``.
+
+    Each field is read from the first matching name among several
+    candidates (see ``first_value``):
+
+    - Events with no parseable start time are skipped, and a message is printed.
+    - An event is all-day if it has an all-day flag or a date-only start.
+      An all-day event spans whole days up to its end date when that is
+      later than the start date. Otherwise it lasts a single day.
+    - A timed event with no end is given a one-hour duration.
+    - The title defaults to ``"Untitled event"``. Description and location
+      are set only when present.
+    - The UID is ``timetree-<id>``, so re-imports update existing entries
+      instead of duplicating them.
+    """
     from ics import Calendar, Event
 
     calendar = Calendar()
@@ -138,7 +200,7 @@ def write_ics(output_file: str, events: list[EventPayload]) -> None:
         )
 
         if all_day:
-            event.begin = date_part(start)
+            event.begin = as_datetime(date_part(start))
             event.make_all_day()
             if end:
                 start_date = date_part(start)
@@ -150,13 +212,11 @@ def write_ics(output_file: str, events: list[EventPayload]) -> None:
                 if duration and duration.days > 0:
                     event.duration = duration
         else:
-            event.begin = start
+            event.begin = as_datetime(start)
             if end:
-                event.end = end
-            elif isinstance(start, datetime):
-                event.end = start + timedelta(hours=1)
-            elif isinstance(start, date):
-                event.end = start + timedelta(days=1)
+                event.end = as_datetime(end)
+            else:
+                event.end = as_datetime(start) + timedelta(hours=1)
 
         description = first_value(
             source_event,
@@ -195,6 +255,7 @@ def write_ics(output_file: str, events: list[EventPayload]) -> None:
 def write_events(
     output_file: str, events: list[EventPayload], file_format: OutputFormat
 ) -> None:
+    """Write ``events`` to ``output_file`` in the given format."""
     if file_format == "ics":
         write_ics(output_file, events)
     else:
@@ -202,6 +263,19 @@ def write_events(
 
 
 async def main() -> None:
+    """Scrape a public TimeTree calendar and write its events to a file.
+
+    Opens the calendar URL in headless Chromium and collects events from the
+    ``public_events`` API responses the page makes. It then clicks "Next
+    month" until one of these happens:
+
+    - a month returns no events
+    - the button disappears
+    - no response arrives within 5 seconds
+
+    Scraping starts at the month the page opens on, so earlier months are not
+    collected.
+    """
     args = parse_args()
     requested_format = cast(OutputFormat | None, args.format)
     file_format = output_format(args.output_file, requested_format)
@@ -215,6 +289,13 @@ async def main() -> None:
         page = await browser.new_page()
 
         async def handle_response(response: Response) -> None:
+            """Collect events from ``public_events`` GET responses.
+
+            Records whether a response had no events, which ends the scrape.
+            Also signals ``current_request_done`` so the main loop can move to
+            the next month. The signal is sent even if reading the response
+            fails.
+            """
             nonlocal last_response_empty
             if "public_events" in response.url and response.request.method == "GET":
                 try:
@@ -276,6 +357,7 @@ async def main() -> None:
 
 
 def cli() -> None:
+    """Entry point for the ``extract-timetree`` console script."""
     asyncio.run(main())
 
 
