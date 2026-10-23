@@ -6,7 +6,7 @@ build-backend = "setuptools.build_meta"
 name = "timetree-scraper"
 version = "0.1.0"
 description = "Scrape public TimeTree events into JSON or ICS."
-readme = ""
+readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
     "ics>=0.7",
