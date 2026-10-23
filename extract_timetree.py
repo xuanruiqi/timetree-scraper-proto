@@ -1,9 +1,12 @@
+"""Scrape public TimeTree events into JSON or ICS."""
+
 import asyncio
 import argparse
 import json
 from datetime import date, datetime, time, timedelta, timezone
 from typing import Any, Literal, TypeAlias, cast
 
+from ics import Calendar, Event
 from playwright.async_api import Response, async_playwright
 
 
@@ -23,6 +26,18 @@ ParsedDateValue: TypeAlias = DateValue | None
 
 # Numeric timestamps larger than this are in milliseconds, not seconds.
 MAX_TIMESTAMP_SECONDS = datetime.max.replace(tzinfo=timezone.utc).timestamp()
+
+# Candidate field names for each event property, in order of preference,
+# since the TimeTree payload's field names are not guaranteed.
+START_KEYS = (
+    "start_at", "starts_at", "start", "started_at", "start_time", "starts_on", "start_date"
+)
+END_KEYS = ("end_at", "ends_at", "end", "ended_at", "end_time", "ends_on", "end_date")
+ALL_DAY_KEYS = ("all_day", "is_all_day", "allDay", "full_day")
+TITLE_KEYS = ("title", "name", "summary")
+DESCRIPTION_KEYS = ("description", "note", "memo", "details", "body")
+LOCATION_KEYS = ("location", "place", "place.name", "venue", "venue.name")
+UID_KEYS = ("id", "uuid", "uid")
 
 
 def parse_args() -> argparse.Namespace:
@@ -86,25 +101,21 @@ def parse_datetime_value(value: JsonValue) -> ParsedDateValue:
     Returns ``None`` for empty values, values that fail to parse, and any
     other type.
     """
-    if not value:
+    try:
+        match value:
+            case bool():  # Checked before int, since bool is a subclass of int.
+                return None
+            case str() if "T" in value:
+                return datetime.fromisoformat(value.replace("Z", "+00:00"))
+            case str() if value:
+                return date.fromisoformat(value)
+            case int() | float() if value:
+                timestamp = value / 1000 if value > MAX_TIMESTAMP_SECONDS else value
+                return datetime.fromtimestamp(timestamp, tz=timezone.utc)
+            case _:
+                return None
+    except (OverflowError, OSError, ValueError):
         return None
-    if isinstance(value, (datetime, date)):
-        return value
-    if isinstance(value, str):
-        normalized = value.replace("Z", "+00:00")
-        try:
-            if "T" in normalized:
-                return datetime.fromisoformat(normalized)
-            return date.fromisoformat(normalized)
-        except ValueError:
-            return None
-    if isinstance(value, (int, float)) and not isinstance(value, bool):
-        timestamp = value / 1000 if value > MAX_TIMESTAMP_SECONDS else value
-        try:
-            return datetime.fromtimestamp(timestamp, tz=timezone.utc)
-        except (OverflowError, OSError, ValueError):
-            return None
-    return None
 
 
 def parse_bool_value(value: JsonValue) -> bool:
@@ -114,11 +125,13 @@ def parse_bool_value(value: JsonValue) -> bool:
     ``"y"`` (case-insensitive, surrounding whitespace ignored). Other values
     use Python truthiness.
     """
-    if isinstance(value, bool):
-        return value
-    if isinstance(value, str):
-        return value.strip().lower() in ("1", "true", "yes", "y")
-    return bool(value)
+    match value:
+        case bool():
+            return value
+        case str():
+            return value.strip().lower() in ("1", "true", "yes", "y")
+        case _:
+            return bool(value)
 
 
 def date_part(value: DateValue) -> date:
@@ -141,112 +154,75 @@ def write_json(output_file: str, events: list[EventPayload]) -> None:
         json.dump({"public_events": events}, f, indent=2)
 
 
-def write_ics(output_file: str, events: list[EventPayload]) -> None:
-    """Convert the events to iCalendar entries and write them to ``output_file``.
+def set_event_times(
+    event: Event, start: DateValue, end: ParsedDateValue, all_day: bool
+) -> None:
+    """Set the begin and end of ``event``.
+
+    An all-day event spans whole days up to its end date when that is later
+    than the start date. Otherwise it lasts a single day. A timed event with
+    no end is given a one-hour duration.
+    """
+    if all_day or not isinstance(start, datetime):
+        event.begin = as_datetime(date_part(start))
+        # Must come before setting the duration, which it would otherwise extend.
+        event.make_all_day()
+        if end and date_part(end) > date_part(start):
+            event.duration = date_part(end) - date_part(start)
+    else:
+        event.begin = start
+        event.end = as_datetime(end) if end else start + timedelta(hours=1)
+
+
+def to_ics_event(source_event: EventPayload) -> Event | None:
+    """Convert a TimeTree event to an iCalendar event.
 
     Each field is read from the first matching name among several
-    candidates (see ``first_value``):
+    candidates (see ``first_value``). Returns ``None`` if the event has no
+    parseable start time.
 
-    - Events with no parseable start time are skipped, and a message is printed.
     - An event is all-day if it has an all-day flag or a date-only start.
-      An all-day event spans whole days up to its end date when that is
-      later than the start date. Otherwise it lasts a single day.
-    - A timed event with no end is given a one-hour duration.
     - The title defaults to ``"Untitled event"``. Description and location
       are set only when present.
     - The UID is ``timetree-<id>``, so re-imports update existing entries
       instead of duplicating them.
     """
-    from ics import Calendar, Event
+    start = parse_datetime_value(first_value(source_event, *START_KEYS))
+    if not start:
+        return None
 
+    location = first_value(source_event, *LOCATION_KEYS)
+    if isinstance(location, dict):
+        location = first_value(location, "name", "title", "address")
+    description = first_value(source_event, *DESCRIPTION_KEYS)
+    uid = first_value(source_event, *UID_KEYS)
+
+    event = Event(name=str(first_value(source_event, *TITLE_KEYS) or "Untitled event"))
+    event.description = str(description) if description else None
+    event.location = str(location) if location else None
+    if uid:
+        event.uid = f"timetree-{uid}"
+    set_event_times(
+        event,
+        start,
+        end=parse_datetime_value(first_value(source_event, *END_KEYS)),
+        all_day=parse_bool_value(first_value(source_event, *ALL_DAY_KEYS)),
+    )
+    return event
+
+
+def write_ics(output_file: str, events: list[EventPayload]) -> None:
+    """Convert the events to iCalendar entries and write them to ``output_file``.
+
+    Events with no parseable start time are skipped, and a message is printed.
+    """
     calendar = Calendar()
-
     for source_event in events:
-        start = parse_datetime_value(
-            first_value(
-                source_event,
-                "start_at",
-                "starts_at",
-                "start",
-                "started_at",
-                "start_time",
-                "starts_on",
-                "start_date",
-            )
-        )
-        if not start:
+        event = to_ics_event(source_event)
+        if event is None:
             print(f"Skipping event with no start time: {source_event.get('id', '<unknown>')}")
-            continue
-
-        end = parse_datetime_value(
-            first_value(
-                source_event,
-                "end_at",
-                "ends_at",
-                "end",
-                "ended_at",
-                "end_time",
-                "ends_on",
-                "end_date",
-            )
-        )
-        all_day = parse_bool_value(
-            first_value(source_event, "all_day", "is_all_day", "allDay", "full_day")
-        ) or (isinstance(start, date) and not isinstance(start, datetime))
-
-        event = Event()
-        event.name = str(
-            first_value(source_event, "title", "name", "summary") or "Untitled event"
-        )
-
-        if all_day:
-            event.begin = as_datetime(date_part(start))
-            event.make_all_day()
-            if end:
-                start_date = date_part(start)
-                end_date = date_part(end)
-                if isinstance(start_date, date) and isinstance(end_date, date):
-                    duration = end_date - start_date
-                else:
-                    duration = None
-                if duration and duration.days > 0:
-                    event.duration = duration
         else:
-            event.begin = as_datetime(start)
-            if end:
-                event.end = as_datetime(end)
-            else:
-                event.end = as_datetime(start) + timedelta(hours=1)
-
-        description = first_value(
-            source_event,
-            "description",
-            "note",
-            "memo",
-            "details",
-            "body",
-        )
-        if description:
-            event.description = str(description)
-
-        location = first_value(
-            source_event,
-            "location",
-            "place",
-            "place.name",
-            "venue",
-            "venue.name",
-        )
-        if isinstance(location, dict):
-            location = first_value(location, "name", "title", "address")
-        if location:
-            event.location = str(location)
-
-        uid = first_value(source_event, "id", "uuid", "uid")
-        if uid:
-            event.uid = f"timetree-{uid}"
-
-        calendar.events.add(event)
+            calendar.events.add(event)
 
     with open(output_file, "w") as f:
         f.writelines(calendar.serialize_iter())
@@ -279,7 +255,7 @@ async def main() -> None:
     args = parse_args()
     requested_format = cast(OutputFormat | None, args.format)
     file_format = output_format(args.output_file, requested_format)
-    
+
     all_events: list[EventPayload] = []
     current_request_done = asyncio.Event()
     last_response_empty = False
@@ -313,16 +289,16 @@ async def main() -> None:
                             if isinstance(event, dict)
                         )
                     current_request_done.set()
-                except Exception as e:
+                except Exception as e:  # pylint: disable=broad-exception-caught
                     print(e)
                     current_request_done.set()
 
         page.on("response", handle_response)
-        
+
         # Initial load
         current_request_done.clear()
         await page.goto(args.url, wait_until="networkidle")
-        
+
         # Wait for the API request to finish
         try:
             await asyncio.wait_for(current_request_done.wait(), timeout=10.0)
@@ -335,22 +311,22 @@ async def main() -> None:
             if await next_btn.count() == 0:
                 print("No next button found, stopping.")
                 break
-            
+
             print("Clicking Next month...")
             current_request_done.clear()
             await next_btn.click()
-            
+
             # Wait for API response
             try:
                 await asyncio.wait_for(current_request_done.wait(), timeout=5.0)
             except asyncio.TimeoutError:
                 print("Timeout waiting for events response, assuming end.")
                 break
-            
+
             await asyncio.sleep(1) # Small pause to let DOM update if needed
 
         write_events(args.output_file, all_events, file_format)
-            
+
         print(f"Total events scraped: {len(all_events)}")
         print(f"Wrote {file_format.upper()} output to {args.output_file}")
         await browser.close()
